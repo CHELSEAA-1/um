@@ -1,0 +1,1191 @@
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local CoreGui = game:GetService("CoreGui")
+
+local LocalPlayer = Players.LocalPlayer
+
+local CONFIG = {
+	AutoFarm = false,
+	EquipBestLoop = false,
+	AutoTrain = false,
+	UpgradePlotLoop = false,
+	UpgradeTrainingLoop = false,
+	X2BoostLoop = false,
+	TapsPerStep = 4,
+	TapInterval = 0.04,
+	SkipInterval = 0.06,
+	PulseInterval = 0.12,
+	EquipBestInterval = 0.5,
+	UpgradePlotInterval = 0.5,
+	UpgradeTrainingInterval = 0.25,
+	X2BoostInterval = 0.25,
+	TeleportCheckInterval = 0.4,
+	CacheRefreshInterval = 1.0,
+	DriftThreshold = 6.5,
+	UseServerClock = true,
+	ThrowChildIndex = 14,
+	TeleportOffset = Vector3.new(0, 2.4, 0),
+	TrainOffset = Vector3.new(0, 2.4, 0),
+}
+
+local UI_LIMITS = {
+	MinWidth = 220,
+	MaxWidth = 460,
+	MinHeight = 200,
+	MaxHeight = 640,
+	DefaultWidth = 270,
+	DefaultHeight = 398,
+	TopBarHeight = 48,
+	MinScale = 0.75,
+	MaxScale = 1.45,
+}
+
+local running = true
+local minimized = false
+local currentScale = 1.0
+local expandedSize = UDim2.fromOffset(UI_LIMITS.DefaultWidth, UI_LIMITS.DefaultHeight)
+
+local ThrowRemote = nil
+local MonsterRemote = nil
+local PlotRemote = nil
+local GoRemote = nil
+local StandRemote = nil
+
+local cachedThrowTarget = nil
+local cachedThrowPart = nil
+local cachedThrowPrompts = nil
+local cachedThrowClicks = nil
+local lastThrowCacheTime = 0
+
+local cachedTrainTarget = nil
+local cachedTrainPart = nil
+local cachedTrainPrompts = nil
+local cachedTrainClicks = nil
+local lastTrainCacheTime = 0
+
+local cachedUpgradeTargets = nil
+
+local savedWalkSpeed = nil
+local savedJumpPower = nil
+local savedJumpHeight = nil
+local savedUseJumpPower = nil
+
+local function getUiParent()
+	local candidates = {}
+
+	if typeof(gethui) == "function" then
+		local ok, res = pcall(gethui)
+		if ok and typeof(res) == "Instance" then
+			table.insert(candidates, res)
+		end
+	end
+
+	table.insert(candidates, CoreGui)
+
+	if LocalPlayer then
+		local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 5)
+		if playerGui then
+			table.insert(candidates, playerGui)
+		end
+	end
+
+	for _, parentObj in ipairs(candidates) do
+		local ok = pcall(function()
+			local probe = Instance.new("Folder")
+			probe.Name = "__UiProbe"
+			probe.Parent = parentObj
+			probe:Destroy()
+		end)
+		if ok then
+			return parentObj
+		end
+	end
+
+	return LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui") or CoreGui
+end
+
+local function invalidateThrowCache()
+	cachedThrowTarget = nil
+	cachedThrowPart = nil
+	cachedThrowPrompts = nil
+	cachedThrowClicks = nil
+	lastThrowCacheTime = 0
+end
+
+local function invalidateTrainCache()
+	cachedTrainTarget = nil
+	cachedTrainPart = nil
+	cachedTrainPrompts = nil
+	cachedTrainClicks = nil
+	lastTrainCacheTime = 0
+end
+
+local function getRootPart()
+	local char = LocalPlayer and LocalPlayer.Character
+	if not char or not char.Parent then
+		return nil, nil
+	end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if not hrp or not hrp:IsA("BasePart") then
+		return nil, hum
+	end
+	return hrp, hum
+end
+
+local function captureCharacterDefaults(humanoid)
+	if not humanoid then
+		return
+	end
+	if not savedWalkSpeed then
+		savedWalkSpeed = humanoid.WalkSpeed > 0 and humanoid.WalkSpeed or 16
+	end
+	if humanoid.UseJumpPower then
+		savedUseJumpPower = true
+		if not savedJumpPower then
+			savedJumpPower = humanoid.JumpPower > 0 and humanoid.JumpPower or 50
+		end
+	else
+		savedUseJumpPower = false
+		if not savedJumpHeight then
+			savedJumpHeight = humanoid.JumpHeight > 0 and humanoid.JumpHeight or 7.2
+		end
+	end
+end
+
+local function restoreCharacterMovement()
+	local hrp, humanoid = getRootPart()
+	if hrp then
+		pcall(function()
+			hrp.Anchored = false
+			hrp.AssemblyLinearVelocity = Vector3.zero
+			hrp.AssemblyAngularVelocity = Vector3.zero
+		end)
+	end
+
+	if humanoid then
+		pcall(function()
+			humanoid.PlatformStand = false
+			humanoid.Sit = false
+			if savedWalkSpeed and humanoid.WalkSpeed <= 0 then
+				humanoid.WalkSpeed = savedWalkSpeed
+			end
+			if savedUseJumpPower and savedJumpPower and humanoid.JumpPower <= 0 then
+				humanoid.JumpPower = savedJumpPower
+			elseif not savedUseJumpPower and savedJumpHeight and humanoid.JumpHeight <= 0 then
+				humanoid.JumpHeight = savedJumpHeight
+			end
+		end)
+	end
+end
+
+if LocalPlayer then
+	LocalPlayer.CharacterAdded:Connect(function(char)
+		savedWalkSpeed = nil
+		savedJumpPower = nil
+		savedJumpHeight = nil
+		savedUseJumpPower = nil
+		invalidateThrowCache()
+		invalidateTrainCache()
+		local hum = char:WaitForChild("Humanoid", 5)
+		captureCharacterDefaults(hum)
+	end)
+	if LocalPlayer.Character then
+		captureCharacterDefaults(LocalPlayer.Character:FindFirstChildOfClass("Humanoid"))
+	end
+end
+
+local function collectInteractables(root)
+	local prompts = {}
+	local clicks = {}
+	if not root then
+		return prompts, clicks
+	end
+	for _, desc in ipairs(root:GetDescendants()) do
+		if desc:IsA("ProximityPrompt") then
+			pcall(function()
+				desc.MaxActivationDistance = math.max(desc.MaxActivationDistance, 1e6)
+			end)
+			table.insert(prompts, desc)
+		elseif desc:IsA("ClickDetector") then
+			table.insert(clicks, desc)
+		end
+	end
+	return prompts, clicks
+end
+
+local function findPrimaryPart(node)
+	if not node then
+		return nil
+	end
+	if node:IsA("BasePart") then
+		return node
+	end
+	if node:IsA("Model") then
+		if node.PrimaryPart and node.PrimaryPart:IsA("BasePart") then
+			return node.PrimaryPart
+		end
+	end
+	return node:FindFirstChildWhichIsA("BasePart", true)
+end
+
+local function resolveThrowTarget(forceRefresh)
+	local now = os.clock()
+	if not forceRefresh and cachedThrowTarget and cachedThrowTarget.Parent and (now - lastThrowCacheTime) < CONFIG.CacheRefreshInterval then
+		if cachedThrowPart and cachedThrowPart.Parent then
+			return cachedThrowTarget
+		end
+	end
+
+	local map = workspace:FindFirstChild("Map")
+	local base = map and map:FindFirstChild("Base")
+	local throwFolder = base and base:FindFirstChild("Throw")
+	if not throwFolder then
+		invalidateThrowCache()
+		return nil
+	end
+
+	local children = throwFolder:GetChildren()
+	local node = children[CONFIG.ThrowChildIndex]
+	if not node then
+		for _, candidate in ipairs(children) do
+			if findPrimaryPart(candidate) then
+				node = candidate
+				break
+			end
+		end
+	end
+
+	if not node then
+		invalidateThrowCache()
+		return nil
+	end
+
+	local part = findPrimaryPart(node)
+	if not part then
+		invalidateThrowCache()
+		return nil
+	end
+
+	local root = node:IsA("BasePart") and node or (node.Parent and node.Parent:IsA("Model") and node.Parent or node)
+	cachedThrowTarget = node
+	cachedThrowPart = part
+	cachedThrowPrompts, cachedThrowClicks = collectInteractables(root)
+	lastThrowCacheTime = now
+
+	return node
+end
+
+local function resolveTrainTarget(forceRefresh)
+	local now = os.clock()
+	if not forceRefresh and cachedTrainTarget and cachedTrainTarget.Parent and (now - lastTrainCacheTime) < CONFIG.CacheRefreshInterval then
+		if cachedTrainPart and cachedTrainPart.Parent then
+			return cachedTrainTarget
+		end
+	end
+
+	local map = workspace:FindFirstChild("Map")
+	local base = map and map:FindFirstChild("Base")
+	local plots = base and base:FindFirstChild("Plots")
+	local plot4 = plots and plots:FindFirstChild("Plot4")
+	local trainingSpot = plot4 and plot4:FindFirstChild("TrainingSpot")
+	local standSpot = trainingSpot and trainingSpot:FindFirstChild("StandSpot")
+	if not standSpot then
+		invalidateTrainCache()
+		return nil
+	end
+
+	local part = findPrimaryPart(standSpot)
+	if not part then
+		invalidateTrainCache()
+		return nil
+	end
+
+	local root = standSpot:IsA("BasePart") and standSpot or (standSpot.Parent and standSpot.Parent:IsA("Model") and standSpot.Parent or standSpot)
+	cachedTrainTarget = standSpot
+	cachedTrainPart = part
+	cachedTrainPrompts, cachedTrainClicks = collectInteractables(root)
+	lastTrainCacheTime = now
+
+	return standSpot
+end
+
+local function clickGuiElement(btn)
+	if not btn or not btn.Parent then
+		return false
+	end
+
+	local clicked = false
+
+	pcall(function()
+		btn:Activate()
+		clicked = true
+	end)
+
+	if typeof(firesignal) == "function" then
+		pcall(function()
+			firesignal(btn.MouseButton1Click)
+			clicked = true
+		end)
+		pcall(function()
+			firesignal(btn.MouseButton1Down)
+			firesignal(btn.MouseButton1Up)
+			firesignal(btn.Activated)
+			clicked = true
+		end)
+	end
+
+	return clicked
+end
+
+local function scanUpgradeTargets()
+	local found = {}
+	local containers = {}
+
+	local playerGui = LocalPlayer and LocalPlayer:FindFirstChildOfClass("PlayerGui")
+	if playerGui then
+		table.insert(containers, playerGui)
+	end
+	if typeof(gethui) == "function" then
+		local ok, h = pcall(gethui)
+		if ok and typeof(h) == "Instance" then
+			table.insert(containers, h)
+		end
+	end
+	table.insert(containers, CoreGui)
+
+	for _, container in ipairs(containers) do
+		for _, desc in ipairs(container:GetDescendants()) do
+			if desc:IsA("GuiButton") and desc.Visible then
+				local matched = false
+				if desc:IsA("TextButton") and string.find(string.lower(desc.Text), "upgrade", 1, true) then
+					matched = true
+				else
+					for _, sub in ipairs(desc:GetDescendants()) do
+						if sub:IsA("TextLabel") and string.find(string.lower(sub.Text), "upgrade", 1, true) then
+							matched = true
+							break
+						end
+					end
+				end
+				if matched then
+					table.insert(found, desc)
+				end
+			end
+		end
+	end
+
+	local map = workspace:FindFirstChild("Map")
+	local base = map and map:FindFirstChild("Base")
+	local plots = base and base:FindFirstChild("Plots")
+	local plot4 = plots and plots:FindFirstChild("Plot4")
+	local trainingSpot = plot4 and plot4:FindFirstChild("TrainingSpot")
+	if trainingSpot then
+		for _, desc in ipairs(trainingSpot:GetDescendants()) do
+			if desc:IsA("ProximityPrompt") then
+				pcall(function()
+					desc.MaxActivationDistance = math.max(desc.MaxActivationDistance, 1e6)
+				end)
+				table.insert(found, desc)
+			elseif desc:IsA("ClickDetector") then
+				table.insert(found, desc)
+			elseif desc:IsA("GuiButton") and desc.Visible then
+				table.insert(found, desc)
+			end
+		end
+	end
+
+	return found
+end
+
+local function clickUpgradeButtonNow()
+	if not running or not CONFIG.UpgradeTrainingLoop then
+		return
+	end
+
+	if not cachedUpgradeTargets or #cachedUpgradeTargets == 0 then
+		cachedUpgradeTargets = scanUpgradeTargets()
+	end
+
+	local anyClicked = false
+	for i = 1, #cachedUpgradeTargets do
+		local item = cachedUpgradeTargets[i]
+		if item and item.Parent then
+			if item:IsA("GuiButton") then
+				if clickGuiElement(item) then
+					anyClicked = true
+				end
+			elseif item:IsA("ProximityPrompt") and typeof(fireproximityprompt) == "function" then
+				pcall(fireproximityprompt, item)
+				anyClicked = true
+			elseif item:IsA("ClickDetector") and typeof(fireclickdetector) == "function" then
+				pcall(fireclickdetector, item)
+				anyClicked = true
+			end
+		end
+	end
+
+	if not anyClicked then
+		cachedUpgradeTargets = scanUpgradeTargets()
+		for i = 1, #cachedUpgradeTargets do
+			local item = cachedUpgradeTargets[i]
+			if item and item.Parent then
+				if item:IsA("GuiButton") then
+					clickGuiElement(item)
+				elseif item:IsA("ProximityPrompt") and typeof(fireproximityprompt) == "function" then
+					pcall(fireproximityprompt, item)
+				elseif item:IsA("ClickDetector") and typeof(fireclickdetector) == "function" then
+					pcall(fireclickdetector, item)
+				end
+			end
+		end
+	end
+end
+
+local function getNodeCFrame(node, partCache)
+	if partCache and partCache.Parent then
+		return partCache.CFrame
+	end
+	if not node or not node.Parent then
+		return nil
+	end
+	if node:IsA("BasePart") then
+		return node.CFrame
+	end
+	if node:IsA("Model") then
+		local ok, cf = pcall(function()
+			return node:GetPivot()
+		end)
+		if ok and typeof(cf) == "CFrame" then
+			return cf
+		end
+	end
+	local part = findPrimaryPart(node)
+	return part and part.CFrame or nil
+end
+
+local function getStandingPosition(basePos, offset)
+	local off = offset or Vector3.new(0, 2.4, 0)
+	local standHeight = math.clamp(off.Y, 2.0, 2.8)
+
+	local params = RaycastParams.new()
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	local ignoreList = {}
+	if LocalPlayer and LocalPlayer.Character then
+		table.insert(ignoreList, LocalPlayer.Character)
+	end
+	params.FilterDescendantsInstances = ignoreList
+
+	local rayOrigin = Vector3.new(basePos.X, basePos.Y + 12, basePos.Z)
+	local rayResult = workspace:Raycast(rayOrigin, Vector3.new(0, -40, 0), params)
+	if rayResult then
+		local groundY = rayResult.Position.Y
+		return Vector3.new(basePos.X + off.X, groundY + standHeight, basePos.Z + off.Z)
+	end
+
+	return Vector3.new(basePos.X + off.X, basePos.Y + standHeight, basePos.Z + off.Z)
+end
+
+local function teleportToCFrame(cf, offset, force)
+	if typeof(cf) ~= "CFrame" then
+		return
+	end
+
+	local hrp, hum = getRootPart()
+	if not hrp then
+		return
+	end
+
+	if hum then
+		pcall(function()
+			if hum.Sit then
+				hum.Sit = false
+			end
+			if hum.PlatformStand then
+				hum.PlatformStand = false
+			end
+		end)
+	end
+
+	local dest = getStandingPosition(cf.Position, offset)
+	local horizontalDist = (Vector3.new(hrp.Position.X, 0, hrp.Position.Z) - Vector3.new(dest.X, 0, dest.Z)).Magnitude
+	local belowGround = hrp.Position.Y < (dest.Y - 2.6)
+
+	if not force and horizontalDist <= CONFIG.DriftThreshold and not belowGround then
+		return
+	end
+
+	pcall(function()
+		hrp.Anchored = false
+		hrp.AssemblyLinearVelocity = Vector3.zero
+		hrp.AssemblyAngularVelocity = Vector3.zero
+		hrp.CFrame = CFrame.new(dest)
+	end)
+end
+
+local function pulseCached(prompts, clicks, part)
+	if prompts and typeof(fireproximityprompt) == "function" then
+		for i = 1, #prompts do
+			local p = prompts[i]
+			if p and p.Parent then
+				pcall(fireproximityprompt, p)
+			end
+		end
+	end
+
+	if clicks and typeof(fireclickdetector) == "function" then
+		for i = 1, #clicks do
+			local c = clicks[i]
+			if c and c.Parent then
+				pcall(fireclickdetector, c)
+			end
+		end
+	end
+
+	local hrp = select(1, getRootPart())
+	if hrp and part and part.Parent and typeof(firetouchinterest) == "function" then
+		pcall(function()
+			firetouchinterest(hrp, part, 0)
+			firetouchinterest(hrp, part, 1)
+		end)
+	end
+end
+
+local function fireRemoteSafe(remote, ...)
+	if not remote or not remote.Parent or not remote:IsA("RemoteEvent") then
+		return false
+	end
+	local args = { ... }
+	local ok = pcall(function()
+		remote:FireServer(table.unpack(args))
+	end)
+	return ok
+end
+
+local function fireEquipBest()
+	fireRemoteSafe(MonsterRemote, "EquipBest")
+end
+
+local function fireUpgradePlot()
+	fireRemoteSafe(PlotRemote, "Upgrade")
+end
+
+local function fireUpgradeTraining()
+	if not CONFIG.UpgradeTrainingLoop then
+		return
+	end
+	fireRemoteSafe(GoRemote, "Training")
+	clickUpgradeButtonNow()
+end
+
+local function fireX2Boost()
+	if not CONFIG.X2BoostLoop then
+		return
+	end
+	fireRemoteSafe(StandRemote, "Boost")
+end
+
+local function fireThrowStep(now, shouldSkip)
+	if not ThrowRemote or not ThrowRemote.Parent then
+		local sharedFolder = ReplicatedStorage:FindFirstChild("Shared")
+		local remotes = sharedFolder and sharedFolder:FindFirstChild("Remotes")
+		if remotes then
+			ThrowRemote = remotes:FindFirstChild("Throw")
+		end
+	end
+
+	if not ThrowRemote or not ThrowRemote:IsA("RemoteEvent") then
+		return
+	end
+
+	local stamp = CONFIG.UseServerClock and workspace:GetServerTimeNow() or tick()
+	for _ = 1, CONFIG.TapsPerStep do
+		pcall(function()
+			ThrowRemote:FireServer("Tap", stamp)
+		end)
+	end
+
+	if shouldSkip then
+		pcall(function()
+			ThrowRemote:FireServer("Skip")
+		end)
+	end
+end
+
+-- Build UI first so it always appears immediately
+local uiParent = getUiParent()
+local existing = uiParent:FindFirstChild("RoubalixThrowGui")
+if existing then
+	existing:Destroy()
+end
+
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Name = "RoubalixThrowGui"
+ScreenGui.ResetOnSpawn = false
+ScreenGui.IgnoreGuiInset = true
+ScreenGui.DisplayOrder = 999999
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Enabled = true
+ScreenGui.Parent = uiParent
+
+-- Top-Center Minimized Pill with Visualizer
+local MiniPill = Instance.new("TextButton")
+MiniPill.Name = "MiniPill"
+MiniPill.Size = UDim2.fromOffset(192, 38)
+MiniPill.Position = UDim2.new(0.5, -96, 0, 10)
+MiniPill.BackgroundColor3 = Color3.fromRGB(19, 18, 24)
+MiniPill.BorderSizePixel = 0
+MiniPill.Text = ""
+MiniPill.AutoButtonColor = false
+MiniPill.Visible = false
+MiniPill.Parent = ScreenGui
+
+local MiniPillCorner = Instance.new("UICorner")
+MiniPillCorner.CornerRadius = UDim.new(0, 10)
+MiniPillCorner.Parent = MiniPill
+
+local MiniPillStroke = Instance.new("UIStroke")
+MiniPillStroke.Color = Color3.fromRGB(214, 66, 36)
+MiniPillStroke.Thickness = 2
+MiniPillStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+MiniPillStroke.Parent = MiniPill
+
+local MiniPillLabel = Instance.new("TextLabel")
+MiniPillLabel.Name = "MiniPillLabel"
+MiniPillLabel.Size = UDim2.new(1, -68, 1, 0)
+MiniPillLabel.Position = UDim2.fromOffset(14, 0)
+MiniPillLabel.BackgroundTransparency = 1
+MiniPillLabel.Text = "ROUBALIX"
+MiniPillLabel.TextColor3 = Color3.fromRGB(245, 246, 250)
+MiniPillLabel.TextSize = 13
+MiniPillLabel.Font = Enum.Font.GothamBold
+MiniPillLabel.TextXAlignment = Enum.TextXAlignment.Left
+MiniPillLabel.Parent = MiniPill
+
+local VisualizerContainer = Instance.new("Frame")
+VisualizerContainer.Name = "VisualizerContainer"
+VisualizerContainer.Size = UDim2.fromOffset(42, 20)
+VisualizerContainer.Position = UDim2.new(1, -52, 0.5, -10)
+VisualizerContainer.BackgroundTransparency = 1
+VisualizerContainer.Parent = MiniPill
+
+local visualizerBars = {}
+local barCount = 5
+local barWidth = 4
+local barGap = 4
+for i = 1, barCount do
+	local bar = Instance.new("Frame")
+	bar.Name = "Bar" .. i
+	bar.Size = UDim2.fromOffset(barWidth, 8)
+	bar.Position = UDim2.new(0, (i - 1) * (barWidth + barGap), 0.5, -4)
+	bar.BackgroundColor3 = Color3.fromRGB(214, 66, 36)
+	bar.BorderSizePixel = 0
+	bar.Parent = VisualizerContainer
+
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(1, 0)
+	barCorner.Parent = bar
+
+	table.insert(visualizerBars, {
+		Frame = bar,
+		Phase = i * 0.85,
+	})
+end
+
+local MainFrame = Instance.new("Frame")
+MainFrame.Name = "MainFrame"
+MainFrame.Size = expandedSize
+MainFrame.Position = UDim2.new(0.5, -135, 0.5, -199)
+MainFrame.BackgroundColor3 = Color3.fromRGB(19, 18, 24)
+MainFrame.BorderSizePixel = 0
+MainFrame.ClipsDescendants = true
+MainFrame.Active = true
+MainFrame.Visible = true
+MainFrame.Parent = ScreenGui
+
+local UiScaleObj = Instance.new("UIScale")
+UiScaleObj.Name = "UiScale"
+UiScaleObj.Scale = currentScale
+UiScaleObj.Parent = MainFrame
+
+local MainCorner = Instance.new("UICorner")
+MainCorner.CornerRadius = UDim.new(0, 12)
+MainCorner.Parent = MainFrame
+
+local MainStroke = Instance.new("UIStroke")
+MainStroke.Color = Color3.fromRGB(214, 66, 36)
+MainStroke.Thickness = 2
+MainStroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+MainStroke.Parent = MainFrame
+
+local TopBar = Instance.new("Frame")
+TopBar.Name = "TopBar"
+TopBar.Size = UDim2.new(1, 0, 0, UI_LIMITS.TopBarHeight)
+TopBar.BackgroundColor3 = Color3.fromRGB(10, 10, 13)
+TopBar.BorderSizePixel = 0
+TopBar.Active = true
+TopBar.Visible = true
+TopBar.Parent = MainFrame
+
+local TopCorner = Instance.new("UICorner")
+TopCorner.CornerRadius = UDim.new(0, 12)
+TopCorner.Parent = TopBar
+
+local TopFill = Instance.new("Frame")
+TopFill.Name = "TopFill"
+TopFill.Size = UDim2.new(1, 0, 0, 12)
+TopFill.Position = UDim2.new(0, 0, 1, -12)
+TopFill.BackgroundColor3 = Color3.fromRGB(10, 10, 13)
+TopFill.BorderSizePixel = 0
+TopFill.Visible = true
+TopFill.Parent = TopBar
+
+local BrandTitle = Instance.new("TextLabel")
+BrandTitle.Name = "BrandTitle"
+BrandTitle.Size = UDim2.new(1, -84, 0, 20)
+BrandTitle.Position = UDim2.fromOffset(14, 5)
+BrandTitle.BackgroundTransparency = 1
+BrandTitle.Text = "ROUBALIX"
+BrandTitle.TextColor3 = Color3.fromRGB(245, 246, 250)
+BrandTitle.TextSize = 14
+BrandTitle.Font = Enum.Font.GothamBold
+BrandTitle.TextXAlignment = Enum.TextXAlignment.Left
+BrandTitle.TextTruncate = Enum.TextTruncate.AtEnd
+BrandTitle.Visible = true
+BrandTitle.Parent = TopBar
+
+local SubTitle = Instance.new("TextLabel")
+SubTitle.Name = "SubTitle"
+SubTitle.Size = UDim2.new(1, -84, 0, 14)
+SubTitle.Position = UDim2.fromOffset(14, 24)
+SubTitle.BackgroundTransparency = 1
+SubTitle.Text = "Throw a Friend for Monsters"
+SubTitle.TextColor3 = Color3.fromRGB(175, 178, 190)
+SubTitle.TextSize = 10
+SubTitle.Font = Enum.Font.GothamMedium
+SubTitle.TextXAlignment = Enum.TextXAlignment.Left
+SubTitle.TextTruncate = Enum.TextTruncate.AtEnd
+SubTitle.Visible = true
+SubTitle.Parent = TopBar
+
+local function makeTopButton(name, text, xOffset, textSize)
+	local btn = Instance.new("TextButton")
+	btn.Name = name
+	btn.Size = UDim2.fromOffset(30, 28)
+	btn.Position = UDim2.new(1, xOffset, 0.5, -14)
+	btn.BackgroundColor3 = Color3.fromRGB(34, 34, 40)
+	btn.BorderSizePixel = 0
+	btn.Text = text
+	btn.TextColor3 = Color3.fromRGB(238, 240, 245)
+	btn.TextSize = textSize
+	btn.Font = Enum.Font.GothamBold
+	btn.Visible = true
+	btn.Parent = TopBar
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 7)
+	corner.Parent = btn
+
+	return btn
+end
+
+local MinimizeBtn = makeTopButton("MinimizeBtn", "-", -72, 16)
+local CloseBtn = makeTopButton("CloseBtn", "□", -38, 14)
+
+local BodyFrame = Instance.new("ScrollingFrame")
+BodyFrame.Name = "BodyFrame"
+BodyFrame.Size = UDim2.new(1, -24, 1, -68)
+BodyFrame.Position = UDim2.fromOffset(12, 54)
+BodyFrame.BackgroundTransparency = 1
+BodyFrame.BorderSizePixel = 0
+BodyFrame.ScrollBarThickness = 3
+BodyFrame.ScrollBarImageColor3 = Color3.fromRGB(214, 66, 36)
+BodyFrame.CanvasSize = UDim2.fromOffset(0, 352)
+BodyFrame.Visible = true
+BodyFrame.Parent = MainFrame
+
+local ResizeHandle = Instance.new("TextButton")
+ResizeHandle.Name = "ResizeHandle"
+ResizeHandle.Size = UDim2.fromOffset(20, 20)
+ResizeHandle.Position = UDim2.new(1, -20, 1, -20)
+ResizeHandle.BackgroundTransparency = 1
+ResizeHandle.Text = "◢"
+ResizeHandle.TextColor3 = Color3.fromRGB(214, 66, 36)
+ResizeHandle.TextSize = 13
+ResizeHandle.Font = Enum.Font.GothamBold
+ResizeHandle.AutoButtonColor = false
+ResizeHandle.Visible = true
+ResizeHandle.Parent = MainFrame
+
+local function createSwitchRow(name, baseLabel, yPos, onChanged)
+	local row = Instance.new("Frame")
+	row.Name = name .. "Row"
+	row.Size = UDim2.new(1, -12, 0, 52)
+	row.Position = UDim2.fromOffset(6, yPos)
+	row.BackgroundTransparency = 1
+	row.Visible = true
+	row.Parent = BodyFrame
+
+	local label = Instance.new("TextLabel")
+	label.Name = "Label"
+	label.Size = UDim2.new(1, -76, 1, 0)
+	label.Position = UDim2.fromOffset(0, 0)
+	label.BackgroundTransparency = 1
+	label.Text = baseLabel .. " OFF"
+	label.TextColor3 = Color3.fromRGB(238, 240, 245)
+	label.TextSize = 13
+	label.Font = Enum.Font.GothamBold
+	label.TextXAlignment = Enum.TextXAlignment.Left
+	label.TextTruncate = Enum.TextTruncate.AtEnd
+	label.Visible = true
+	label.Parent = row
+
+	local track = Instance.new("TextButton")
+	track.Name = "SwitchTrack"
+	track.Size = UDim2.fromOffset(64, 32)
+	track.Position = UDim2.new(1, -64, 0.5, -16)
+	track.BackgroundColor3 = Color3.fromRGB(48, 49, 58)
+	track.BorderSizePixel = 0
+	track.Text = ""
+	track.AutoButtonColor = false
+	track.Visible = true
+	track.Parent = row
+
+	local trackCorner = Instance.new("UICorner")
+	trackCorner.CornerRadius = UDim.new(1, 0)
+	trackCorner.Parent = track
+
+	local knob = Instance.new("Frame")
+	knob.Name = "Knob"
+	knob.Size = UDim2.fromOffset(24, 24)
+	knob.Position = UDim2.fromOffset(4, 4)
+	knob.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+	knob.BorderSizePixel = 0
+	knob.Visible = true
+	knob.Parent = track
+
+	local knobCorner = Instance.new("UICorner")
+	knobCorner.CornerRadius = UDim.new(1, 0)
+	knobCorner.Parent = knob
+
+	local active = false
+
+	local function setVisualState(isOn, instant)
+		active = isOn
+		label.Text = string.format("%s %s", baseLabel, isOn and "ON" or "OFF")
+
+		local targetTrackColor = isOn and Color3.fromRGB(36, 150, 88) or Color3.fromRGB(48, 49, 58)
+		local targetKnobPos = isOn and UDim2.fromOffset(36, 4) or UDim2.fromOffset(4, 4)
+
+		if instant then
+			track.BackgroundColor3 = targetTrackColor
+			knob.Position = targetKnobPos
+		else
+			TweenService:Create(track, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				BackgroundColor3 = targetTrackColor,
+			}):Play()
+			TweenService:Create(knob, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
+				Position = targetKnobPos,
+			}):Play()
+		end
+	end
+
+	setVisualState(false, true)
+
+	track.MouseButton1Click:Connect(function()
+		setVisualState(not active, false)
+		onChanged(active)
+	end)
+
+	return {
+		SetState = function(v)
+			setVisualState(v, false)
+		end,
+	}
+end
+
+local autoSwitch
+local equipSwitch
+local trainSwitch
+local upgradePlotSwitch
+local upgradeTrainingSwitch
+local x2BoostSwitch
+
+autoSwitch = createSwitchRow("Auto", "AUTO", 2, function(state)
+	CONFIG.AutoFarm = state
+	if state then
+		if CONFIG.AutoTrain then
+			CONFIG.AutoTrain = false
+			trainSwitch.SetState(false)
+		end
+		invalidateThrowCache()
+		local target = resolveThrowTarget(true)
+		local cf = getNodeCFrame(target, cachedThrowPart)
+		if cf then
+			teleportToCFrame(cf, CONFIG.TeleportOffset, true)
+		end
+		task.defer(function()
+			if CONFIG.AutoFarm and running then
+				fireThrowStep(os.clock(), true)
+			end
+		end)
+	else
+		restoreCharacterMovement()
+	end
+end)
+
+equipSwitch = createSwitchRow("EquipBest", "EQUIP BEST", 60, function(state)
+	CONFIG.EquipBestLoop = state
+	if state then
+		fireEquipBest()
+	end
+end)
+
+trainSwitch = createSwitchRow("AutoTrain", "AUTO TRAIN", 118, function(state)
+	CONFIG.AutoTrain = state
+	if state then
+		if CONFIG.AutoFarm then
+			CONFIG.AutoFarm = false
+			autoSwitch.SetState(false)
+		end
+		invalidateTrainCache()
+		local spot = resolveTrainTarget(true)
+		local cf = getNodeCFrame(spot, cachedTrainPart)
+		if cf then
+			teleportToCFrame(cf, CONFIG.TrainOffset, true)
+		end
+	else
+		restoreCharacterMovement()
+	end
+end)
+
+upgradePlotSwitch = createSwitchRow("UpgradePlot", "UPGRADE PLOT", 176, function(state)
+	CONFIG.UpgradePlotLoop = state
+	if state then
+		fireUpgradePlot()
+	end
+end)
+
+upgradeTrainingSwitch = createSwitchRow("UpgradeTraining", "UPGRADE TRAINING", 234, function(state)
+	CONFIG.UpgradeTrainingLoop = state
+	if state then
+		cachedUpgradeTargets = scanUpgradeTargets()
+		fireUpgradeTraining()
+		task.defer(clickUpgradeButtonNow)
+	else
+		cachedUpgradeTargets = nil
+		restoreCharacterMovement()
+	end
+end)
+
+x2BoostSwitch = createSwitchRow("X2Boost", "X2 BOOST", 292, function(state)
+	CONFIG.X2BoostLoop = state
+	if state then
+		fireX2Boost()
+	end
+end)
+
+-- Smooth Dragging via TopBar
+local dragging = false
+local dragInput = nil
+local dragStart = nil
+local startPos = nil
+
+TopBar.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = MainFrame.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+TopBar.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		dragInput = input
+	end
+end)
+
+-- Corner Resize Handle
+local resizing = false
+local resizeInput = nil
+local resizeStart = nil
+local startSize = nil
+
+ResizeHandle.InputBegan:Connect(function(input)
+	if minimized then
+		return
+	end
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		resizing = true
+		resizeStart = input.Position
+		startSize = MainFrame.Size
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				resizing = false
+			end
+		end)
+	end
+end)
+
+ResizeHandle.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+		resizeInput = input
+	end
+end)
+
+local inputChangedConn = UserInputService.InputChanged:Connect(function(input)
+	if dragging and input == dragInput and dragStart and startPos then
+		local delta = input.Position - dragStart
+		MainFrame.Position = UDim2.new(
+			startPos.X.Scale,
+			startPos.X.Offset + delta.X,
+			startPos.Y.Scale,
+			startPos.Y.Offset + delta.Y
+		)
+	elseif resizing and input == resizeInput and resizeStart and startSize and not minimized then
+		local delta = (input.Position - resizeStart) / currentScale
+		local newW = math.clamp(math.floor(startSize.X.Offset + delta.X + 0.5), UI_LIMITS.MinWidth, UI_LIMITS.MaxWidth)
+		local newH = math.clamp(math.floor(startSize.Y.Offset + delta.Y + 0.5), UI_LIMITS.MinHeight, UI_LIMITS.MaxHeight)
+		expandedSize = UDim2.fromOffset(newW, newH)
+		MainFrame.Size = expandedSize
+	end
+end)
+
+local function setMinimizedState(isMin)
+	minimized = isMin
+	MainFrame.Visible = not minimized
+	MiniPill.Visible = minimized
+	MiniPill.Position = UDim2.new(0.5, -96, 0, 10)
+	MinimizeBtn.Text = minimized and "+" or "-"
+end
+
+MinimizeBtn.MouseButton1Click:Connect(function()
+	setMinimizedState(true)
+end)
+
+MiniPill.MouseButton1Click:Connect(function()
+	setMinimizedState(false)
+end)
+
+MainFrame.Visible = true
+MiniPill.Visible = false
+ScreenGui.Enabled = true
+
+-- Resolve remotes in background so UI never blocks
+task.spawn(function()
+	local sharedFolder = ReplicatedStorage:FindFirstChild("Shared") or ReplicatedStorage:WaitForChild("Shared", 10)
+	local remotes = sharedFolder and (sharedFolder:FindFirstChild("Remotes") or sharedFolder:WaitForChild("Remotes", 10))
+	if remotes then
+		ThrowRemote = remotes:FindFirstChild("Throw") or remotes:WaitForChild("Throw", 10)
+		MonsterRemote = remotes:FindFirstChild("Monster") or remotes:WaitForChild("Monster", 10)
+		PlotRemote = remotes:FindFirstChild("Plot") or remotes:WaitForChild("Plot", 10)
+		GoRemote = remotes:FindFirstChild("Go") or remotes:WaitForChild("Go", 10)
+		StandRemote = remotes:FindFirstChild("Stand") or remotes:WaitForChild("Stand", 10)
+	end
+end)
+
+local heartbeatConn
+CloseBtn.MouseButton1Click:Connect(function()
+	running = false
+	CONFIG.AutoFarm = false
+	CONFIG.EquipBestLoop = false
+	CONFIG.AutoTrain = false
+	CONFIG.UpgradePlotLoop = false
+	CONFIG.UpgradeTrainingLoop = false
+	CONFIG.X2BoostLoop = false
+	invalidateThrowCache()
+	invalidateTrainCache()
+	cachedUpgradeTargets = nil
+	restoreCharacterMovement()
+	if inputChangedConn then
+		inputChangedConn:Disconnect()
+		inputChangedConn = nil
+	end
+	if heartbeatConn then
+		heartbeatConn:Disconnect()
+		heartbeatConn = nil
+	end
+	ScreenGui:Destroy()
+end)
+
+local lastTap = 0
+local lastSkip = 0
+local lastPrompt = 0
+local lastTpCheck = 0
+local lastEquip = 0
+local lastUpgradePlot = 0
+local lastUpgradeTraining = 0
+local lastX2Boost = 0
+
+heartbeatConn = RunService.Heartbeat:Connect(function()
+	if not running then
+		return
+	end
+
+	local now = os.clock()
+
+	if minimized and MiniPill.Visible then
+		MiniPill.Position = UDim2.new(0.5, -96, 0, 10)
+		for i = 1, #visualizerBars do
+			local entry = visualizerBars[i]
+			local wave = (math.sin(now * 8 + entry.Phase) + 1) * 0.5
+			local h = math.floor(5 + wave * 15)
+			entry.Frame.Size = UDim2.fromOffset(barWidth, h)
+			entry.Frame.Position = UDim2.new(0, (i - 1) * (barWidth + barGap), 0.5, -math.floor(h * 0.5))
+		end
+	end
+
+	if CONFIG.EquipBestLoop and now - lastEquip >= CONFIG.EquipBestInterval then
+		lastEquip = now
+		fireEquipBest()
+	end
+
+	if CONFIG.UpgradePlotLoop and now - lastUpgradePlot >= CONFIG.UpgradePlotInterval then
+		lastUpgradePlot = now
+		fireUpgradePlot()
+	end
+
+	if CONFIG.UpgradeTrainingLoop and now - lastUpgradeTraining >= CONFIG.UpgradeTrainingInterval then
+		lastUpgradeTraining = now
+		fireUpgradeTraining()
+	end
+
+	if CONFIG.X2BoostLoop and now - lastX2Boost >= CONFIG.X2BoostInterval then
+		lastX2Boost = now
+		fireX2Boost()
+	end
+
+	if CONFIG.AutoFarm then
+		local target = resolveThrowTarget(false)
+		local targetCf = target and getNodeCFrame(target, cachedThrowPart)
+
+		if targetCf and now - lastTpCheck >= CONFIG.TeleportCheckInterval then
+			lastTpCheck = now
+			teleportToCFrame(targetCf, CONFIG.TeleportOffset, false)
+		end
+
+		if target and now - lastPrompt >= CONFIG.PulseInterval then
+			lastPrompt = now
+			pulseCached(cachedThrowPrompts, cachedThrowClicks, cachedThrowPart)
+		end
+
+		if now - lastTap >= CONFIG.TapInterval then
+			lastTap = now
+			local shouldSkip = (now - lastSkip) >= CONFIG.SkipInterval
+			if shouldSkip then
+				lastSkip = now
+			end
+			fireThrowStep(now, shouldSkip)
+		end
+	end
+end)
